@@ -1,0 +1,204 @@
+name: rk1-desk
+
+x-app: &app
+  build: ./app
+  init: true
+  restart: unless-stopped
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  volumes: [./runtime:/runtime:ro]
+  environment: &app-env
+    DB_NAME: desk
+    DB_USER: app
+    DB_PASSWORD: ${APP_PASSWORD:?Run bash scripts/init-env.sh}
+    REDIS_PASSWORD: ${REDIS_PASSWORD:?Run bash scripts/init-env.sh}
+    NATS_TOKEN: ${NATS_TOKEN:?Run bash scripts/init-env.sh}
+    NATS_REPLICAS: "3"
+
+services:
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    ports: [127.0.0.1:8080:80]
+    networks:
+      edge: {ipv4_address: 172.30.10.10}
+    depends_on:
+      api: {condition: service_healthy}
+      firewall-api: {condition: service_healthy}
+
+  api:
+    <<: *app
+    environment:
+      <<: *app-env
+      SERVICE_NAME: api
+    networks:
+      edge: {ipv4_address: 172.30.10.20}
+      data: {ipv4_address: 172.30.20.20}
+      cache: {ipv4_address: 172.30.30.20}
+      messaging: {ipv4_address: 172.30.40.20}
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      nats1: {condition: service_healthy}
+      nats2: {condition: service_healthy}
+      nats3: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/live', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  worker:
+    <<: *app
+    command: [python, worker.py]
+    environment:
+      <<: *app-env
+      SERVICE_NAME: worker
+    networks:
+      data: {ipv4_address: 172.30.20.21}
+      messaging: {ipv4_address: 172.30.40.21}
+    depends_on:
+      db: {condition: service_healthy}
+      api: {condition: service_healthy}
+
+  db:
+    image: postgres:16-alpine
+    restart: "no"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: desk
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run bash scripts/init-env.sh}
+      APP_PASSWORD: ${APP_PASSWORD:?Run bash scripts/init-env.sh}
+      REPL_PASSWORD: ${REPL_PASSWORD:?Run bash scripts/init-env.sh}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    command: [postgres, -c, wal_level=replica, -c, max_wal_senders=10, -c, wal_keep_size=128MB, -c, hba_file=/etc/postgresql/pg_hba.conf]
+    networks:
+      data: {ipv4_address: 172.30.20.10}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      - ./db/init.sh:/docker-entrypoint-initdb.d/01-init.sh:ro
+      - ./db/schema.sql:/schema/schema.sql:ro
+      - ./db/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U postgres -d desk"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  db-standby:
+    image: postgres:16-alpine
+    user: postgres
+    restart: "no"
+    environment:
+      PGDATA: /var/lib/postgresql/data/standby
+      PGPASSWORD: ${REPL_PASSWORD:?Run bash scripts/init-env.sh}
+    entrypoint: [sh, /standby.sh]
+    networks:
+      data: {ipv4_address: 172.30.20.11}
+    depends_on:
+      db: {condition: service_healthy}
+    volumes:
+      - standby-data:/var/lib/postgresql/data
+      - ./db/standby.sh:/standby.sh:ro
+      - ./db/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U postgres -d desk"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Run bash scripts/init-env.sh}
+    command: [sh, -c, 'exec redis-server --requirepass "$$REDIS_PASSWORD" --maxmemory 64mb --maxmemory-policy allkeys-lru']
+    networks:
+      cache: {ipv4_address: 172.30.30.10}
+    healthcheck:
+      test: [CMD-SHELL, 'REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli ping | grep PONG']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  nats1:
+    image: nats:2.11-alpine
+    restart: "no"
+    command: [-c, /etc/nats/nats.conf]
+    environment: {NATS_TOKEN: "${NATS_TOKEN:?Run bash scripts/init-env.sh}"}
+    networks:
+      messaging: {ipv4_address: 172.30.40.10}
+    volumes: [./nats/nats1.conf:/etc/nats/nats.conf:ro, nats1-data:/data]
+    healthcheck: &nats-health
+      test: [CMD, wget, -qO-, "http://127.0.0.1:8222/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  nats2:
+    image: nats:2.11-alpine
+    restart: "no"
+    command: [-c, /etc/nats/nats.conf]
+    environment: {NATS_TOKEN: "${NATS_TOKEN:?Run bash scripts/init-env.sh}"}
+    networks:
+      messaging: {ipv4_address: 172.30.40.11}
+    volumes: [./nats/nats2.conf:/etc/nats/nats.conf:ro, nats2-data:/data]
+    healthcheck: *nats-health
+
+  nats3:
+    image: nats:2.11-alpine
+    restart: "no"
+    command: [-c, /etc/nats/nats.conf]
+    environment: {NATS_TOKEN: "${NATS_TOKEN:?Run bash scripts/init-env.sh}"}
+    networks:
+      messaging: {ipv4_address: 172.30.40.12}
+    volumes: [./nats/nats3.conf:/etc/nats/nats.conf:ro, nats3-data:/data]
+    healthcheck: *nats-health
+
+  firewall-api:
+    build: ./firewall
+    restart: unless-stopped
+    network_mode: service:api
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN]
+    environment: {ROLE: api}
+    healthcheck:
+      test: [CMD, test, -f, /tmp/ready]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  firewall-worker:
+    build: ./firewall
+    restart: unless-stopped
+    network_mode: service:worker
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN]
+    environment: {ROLE: worker}
+    healthcheck:
+      test: [CMD, test, -f, /tmp/ready]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+networks:
+  edge:
+    ipam: {config: [{subnet: 172.30.10.0/24}]}
+  data:
+    internal: true
+    ipam: {config: [{subnet: 172.30.20.0/24}]}
+  cache:
+    internal: true
+    ipam: {config: [{subnet: 172.30.30.0/24}]}
+  messaging:
+    internal: true
+    ipam: {config: [{subnet: 172.30.40.0/24}]}
+
+volumes:
+  db-data:
+  standby-data:
+  nats1-data:
+  nats2-data:
+  nats3-data:
